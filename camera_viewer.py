@@ -8,6 +8,8 @@ import time
 import os
 import signal
 import sys
+import tempfile
+import platform
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from onvif import ONVIFCamera, ONVIFError
@@ -38,6 +40,14 @@ recording_start_locks = {}  # Locks um zu verhindern, dass mehrere Aufnahmen gle
 scan_in_progress = False
 scan_lock = threading.Lock()
 
+# Video-Aufnahme Konfiguration
+VIDEO_QUALITY = 65  # Qualität für Video-Aufnahmen (0-100, höher = bessere Qualität, größere Datei)
+
+# Globale Login-Daten für alle Kameras
+camera_username = 'admin'
+camera_password = '123456'
+credentials_lock = threading.Lock()
+
 # HTML Template für die Web-Oberfläche
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -63,6 +73,7 @@ HTML_TEMPLATE = """
         .header {
             text-align: center;
             margin-bottom: 30px;
+            position: relative;
         }
         
         .header h1 {
@@ -74,6 +85,21 @@ HTML_TEMPLATE = """
         .header p {
             color: #aaa;
             font-size: 1.1em;
+        }
+        
+        .settings-icon {
+            position: absolute;
+            top: 0;
+            right: 20px;
+            font-size: 2em;
+            cursor: pointer;
+            color: #4CAF50;
+            transition: transform 0.3s;
+        }
+        
+        .settings-icon:hover {
+            transform: rotate(90deg);
+            color: #45a049;
         }
         
         .controls {
@@ -224,22 +250,241 @@ HTML_TEMPLATE = """
             font-size: 1.2em;
         }
         
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.7);
+            overflow: auto;
+        }
+        
+        .modal-content {
+            background-color: #2a2a2a;
+            margin: 10% auto;
+            padding: 30px;
+            border: 2px solid #4CAF50;
+            border-radius: 10px;
+            width: 90%;
+            max-width: 500px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.5);
+            position: relative;
+        }
+        
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid #555;
+        }
+        
+        .modal-header h2 {
+            margin: 0;
+            color: #4CAF50;
+            font-size: 1.5em;
+        }
+        
+        .close {
+            color: #aaa;
+            font-size: 28px;
+            font-weight: bold;
+            cursor: pointer;
+            line-height: 1;
+            transition: color 0.3s;
+        }
+        
+        .close:hover {
+            color: #fff;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            color: #fff;
+            font-weight: bold;
+            font-size: 1em;
+        }
+        
+        .form-group input {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #555;
+            border-radius: 5px;
+            background: #1a1a1a;
+            color: #fff;
+            font-size: 16px;
+            box-sizing: border-box;
+        }
+        
+        .form-group input:focus {
+            outline: none;
+            border-color: #4CAF50;
+        }
+        
+        .form-actions {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+            margin-top: 25px;
+            padding-top: 20px;
+            border-top: 1px solid #555;
+        }
+        
+        .btn-secondary {
+            background: #666;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background 0.3s;
+        }
+        
+        .btn-secondary:hover {
+            background: #777;
+        }
+        
+        .recordings-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+        }
+        
+        .recording-item {
+            background: #333;
+            border-radius: 8px;
+            padding: 15px;
+            border: 1px solid #555;
+            transition: border-color 0.3s;
+        }
+        
+        .recording-item:hover {
+            border-color: #4CAF50;
+        }
+        
+        .recording-info {
+            margin-bottom: 10px;
+        }
+        
+        .recording-info h4 {
+            margin: 0 0 5px 0;
+            color: #4CAF50;
+            font-size: 1em;
+        }
+        
+        .recording-info p {
+            margin: 3px 0;
+            color: #aaa;
+            font-size: 0.85em;
+        }
+        
+        .recording-video {
+            width: 100%;
+            max-height: 200px;
+            border-radius: 5px;
+            background: #000;
+        }
+        
+        .recording-actions {
+            margin-top: 10px;
+            display: flex;
+            gap: 10px;
+        }
+        
+        .btn-small {
+            padding: 6px 12px;
+            font-size: 12px;
+        }
+        
+        .no-recordings {
+            text-align: center;
+            padding: 40px;
+            color: #aaa;
+        }
+        
         @media (max-width: 768px) {
             .grid {
                 grid-template-columns: 1fr;
+            }
+            
+            .settings-icon {
+                right: 10px;
+                font-size: 1.5em;
+            }
+            
+            .modal-content {
+                margin: 5% auto;
+                padding: 20px;
+                width: 95%;
+            }
+            
+            .modal-header h2 {
+                font-size: 1.2em;
             }
         }
     </style>
 </head>
 <body>
     <div class="header">
+        <span class="settings-icon" onclick="openSettings()" title="Einstellungen">⚙️</span>
         <h1>📹 ONVIF Camera Viewer</h1>
         <p>Live-Streams aller gefundenen Kameras</p>
+    </div>
+    
+    <!-- Settings Modal -->
+    <div id="settingsModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>⚙️ Kamera-Login Einstellungen</h2>
+                <span class="close" onclick="closeSettings()">&times;</span>
+            </div>
+            <form onsubmit="saveSettings(event)">
+                <div class="form-group">
+                    <label for="username">Benutzername:</label>
+                    <input type="text" id="username" name="username" required>
+                </div>
+                <div class="form-group">
+                    <label for="password">Passwort:</label>
+                    <input type="password" id="password" name="password" required>
+                </div>
+                <div class="form-actions">
+                    <button type="button" class="btn-secondary" onclick="closeSettings()">Abbrechen</button>
+                    <button type="submit" class="btn">Speichern & Neu verbinden</button>
+                </div>
+            </form>
+        </div>
     </div>
     
     <div class="controls">
         <button class="btn" onclick="scanCameras()">🔍 Kameras scannen</button>
         <button class="btn" onclick="location.reload()">🔄 Seite aktualisieren</button>
+        <button class="btn" onclick="showRecordings()">📁 Aufnahmen anzeigen</button>
+    </div>
+    
+    <!-- Recordings Modal -->
+    <div id="recordingsModal" class="modal">
+        <div class="modal-content" style="max-width: 900px;">
+            <div class="modal-header">
+                <h2>📁 Aufnahmen</h2>
+                <span class="close" onclick="closeRecordings()">&times;</span>
+            </div>
+            <div id="recordingsList" style="max-height: 70vh; overflow-y: auto;">
+                <div style="text-align: center; padding: 20px; color: #aaa;">
+                    Lade Aufnahmen...
+                </div>
+            </div>
+        </div>
     </div>
     
     <div class="status" id="status">
@@ -299,6 +544,122 @@ HTML_TEMPLATE = """
                 .catch(error => {
                     document.getElementById('status').textContent = 'Fehler beim Scannen: ' + error;
                 });
+        }
+        
+        function openSettings() {
+            // Lade aktuelle Credentials
+            fetch('/api/credentials')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('username').value = data.username || 'admin';
+                    document.getElementById('password').value = '';
+                    document.getElementById('settingsModal').style.display = 'block';
+                })
+                .catch(error => {
+                    console.error('Fehler beim Laden der Credentials:', error);
+                    document.getElementById('settingsModal').style.display = 'block';
+                });
+        }
+        
+        function closeSettings() {
+            document.getElementById('settingsModal').style.display = 'none';
+        }
+        
+        function saveSettings(event) {
+            event.preventDefault();
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            
+            fetch('/api/credentials', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({username: username, password: password})
+            })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        alert('Login-Daten gespeichert! Kameras werden neu verbunden...');
+                        closeSettings();
+                        // Starte neuen Scan mit neuen Credentials
+                        scanCameras();
+                    } else {
+                        alert('Fehler: ' + data.message);
+                    }
+                })
+                .catch(error => {
+                    alert('Fehler beim Speichern: ' + error);
+                });
+        }
+        
+        // Schließe Modal wenn außerhalb geklickt wird
+        window.onclick = function(event) {
+            const settingsModal = document.getElementById('settingsModal');
+            const recordingsModal = document.getElementById('recordingsModal');
+            if (event.target == settingsModal) {
+                closeSettings();
+            }
+            if (event.target == recordingsModal) {
+                closeRecordings();
+            }
+        }
+        
+        function showRecordings() {
+            document.getElementById('recordingsModal').style.display = 'block';
+            loadRecordings();
+        }
+        
+        function closeRecordings() {
+            document.getElementById('recordingsModal').style.display = 'none';
+        }
+        
+        function loadRecordings() {
+            const list = document.getElementById('recordingsList');
+            list.innerHTML = '<div style="text-align: center; padding: 20px; color: #aaa;">Lade Aufnahmen...</div>';
+            
+            fetch('/api/recordings')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success && data.recordings && data.recordings.length > 0) {
+                        displayRecordings(data.recordings);
+                    } else {
+                        list.innerHTML = '<div class="no-recordings"><p>Keine Aufnahmen gefunden</p></div>';
+                    }
+                })
+                .catch(error => {
+                    console.error('Fehler beim Laden der Aufnahmen:', error);
+                    list.innerHTML = '<div class="no-recordings"><p>Fehler beim Laden der Aufnahmen</p></div>';
+                });
+        }
+        
+        function displayRecordings(recordings) {
+            const list = document.getElementById('recordingsList');
+            let html = '<div class="recordings-grid">';
+            
+            recordings.forEach(recording => {
+                const date = new Date(recording.timestamp * 1000).toLocaleString('de-DE');
+                html += `
+                    <div class="recording-item">
+                        <div class="recording-info">
+                            <h4>${recording.camera || recording.filename}</h4>
+                            <p>📅 ${date}</p>
+                            <p>💾 ${(recording.size / (1024 * 1024)).toFixed(2)} MB</p>
+                            <p>📍 ${recording.filename}</p>
+                        </div>
+                        <video class="recording-video" controls preload="metadata">
+                            <source src="/api/recordings/play/${encodeURIComponent(recording.filename)}" type="video/mp4">
+                            Ihr Browser unterstützt das Video-Tag nicht.
+                        </video>
+                        <div class="recording-actions">
+                            <a href="/api/recordings/download/${encodeURIComponent(recording.filename)}" class="btn btn-small" download>⬇️ Download</a>
+                        </div>
+                    </div>
+                `;
+            });
+            
+            html += '</div>';
+            list.innerHTML = html;
         }
         
         function toggleRecording(cameraIndex) {
@@ -602,9 +963,17 @@ def scan_camera(host, port, username, password):
         return None
 
 
-def scan_network(username='admin', password='123456', ports=[888, 835]):
+def scan_network(username=None, password=None, ports=[888, 835]):
     """Scannt das Netzwerk nach ONVIF-Kameras"""
-    global found_cameras, scan_in_progress
+    global found_cameras, scan_in_progress, camera_username, camera_password
+    
+    # Verwende globale Credentials falls nicht übergeben
+    if username is None:
+        with credentials_lock:
+            username = camera_username
+    if password is None:
+        with credentials_lock:
+            password = camera_password
     
     # Prüfe ob bereits ein Scan läuft
     with scan_lock:
@@ -935,18 +1304,22 @@ def record_camera(camera_index):
         for codec_name in ['avc1', 'H264', 'h264', 'X264']:
             try:
                 test_fourcc = cv2.VideoWriter_fourcc(*codec_name)
-                # Teste ob Codec funktioniert
-                test_writer = cv2.VideoWriter('/tmp/test_codec.mp4', test_fourcc, fps, (width, height))
+                # Teste ob Codec funktioniert - verwende plattformunabhängigen temporären Pfad
+                temp_dir = tempfile.gettempdir()
+                test_file = os.path.join(temp_dir, f'test_codec_{os.getpid()}.mp4')
+                test_writer = cv2.VideoWriter(test_file, test_fourcc, fps, (width, height))
                 if test_writer.isOpened():
                     test_writer.release()
                     try:
-                        os.remove('/tmp/test_codec.mp4')
+                        if os.path.exists(test_file):
+                            os.remove(test_file)
                     except:
                         pass
                     fourcc = test_fourcc
                     logger.debug(f"H.264 Codec '{codec_name}' funktioniert")
                     break
-            except:
+            except Exception as e:
+                logger.debug(f"Codec '{codec_name}' Test fehlgeschlagen: {e}")
                 continue
         
         # Fallback auf mp4v falls H.264 nicht verfügbar
@@ -958,9 +1331,8 @@ def record_camera(camera_index):
         # Versuche Qualitätsparameter zu setzen (nicht alle Codecs unterstützen das)
         try:
             current_writer = cv2.VideoWriter(current_filename, fourcc, fps, (width, height))
-            # Setze Qualität (0-100, höher = bessere Qualität, größere Datei)
-            # 85 ist ein guter Kompromiss zwischen Qualität und Dateigröße
-            current_writer.set(cv2.VIDEOWRITER_PROP_QUALITY, 85)
+            # Setze Qualität aus Konfiguration (0-100, höher = bessere Qualität, größere Datei)
+            current_writer.set(cv2.VIDEOWRITER_PROP_QUALITY, VIDEO_QUALITY)
         except:
             # Fallback ohne Qualitätsparameter
             current_writer = cv2.VideoWriter(current_filename, fourcc, fps, (width, height))
@@ -1094,6 +1466,168 @@ def record_status():
     return status
 
 
+@app.route('/api/credentials', methods=['GET'])
+def get_credentials():
+    """Gibt aktuelle Login-Daten zurück"""
+    with credentials_lock:
+        return {
+            'username': camera_username,
+            'password': '***'  # Passwort nicht zurückgeben aus Sicherheitsgründen
+        }
+
+
+@app.route('/api/credentials', methods=['POST'])
+def set_credentials():
+    """Setzt neue Login-Daten und verbindet Kameras neu"""
+    global camera_username, camera_password, found_cameras
+    
+    try:
+        from flask import request
+        data = request.get_json()
+        
+        if not data or 'username' not in data or 'password' not in data:
+            return {'success': False, 'message': 'Username und Password erforderlich'}, 400
+        
+        new_username = data['username'].strip()
+        new_password = data['password'].strip()
+        
+        if not new_username or not new_password:
+            return {'success': False, 'message': 'Username und Password dürfen nicht leer sein'}, 400
+        
+        # Stoppe alle laufenden Aufnahmen
+        logger.info("Stoppe alle laufenden Aufnahmen vor Credential-Änderung...")
+        for camera_index in list(recording_status.keys()):
+            try:
+                stop_recording(camera_index)
+            except:
+                pass
+        
+        # Aktualisiere Credentials
+        with credentials_lock:
+            camera_username = new_username
+            camera_password = new_password
+        
+        logger.info(f"Login-Daten aktualisiert: {new_username}")
+        
+        # Starte neuen Scan mit neuen Credentials
+        logger.info("Starte neuen Scan mit aktualisierten Credentials...")
+        try:
+            cameras = scan_network(username=new_username, password=new_password)
+            logger.info(f"Neuer Scan abgeschlossen: {len(cameras)} Kamera(s) gefunden")
+            return {
+                'success': True,
+                'message': f'Login-Daten aktualisiert. {len(cameras)} Kamera(s) mit neuen Credentials gefunden.'
+            }
+        except Exception as e:
+            logger.error(f"Fehler beim Neuscan: {e}")
+            return {
+                'success': False,
+                'message': f'Credentials gespeichert, aber Fehler beim Neuscan: {str(e)}'
+            }
+            
+    except Exception as e:
+        logger.error(f"Fehler beim Setzen der Credentials: {e}")
+        return {'success': False, 'message': str(e)}, 500
+
+
+@app.route('/api/recordings', methods=['GET'])
+def get_recordings():
+    """Gibt Liste aller Aufnahmen zurück, sortiert nach Datum (neueste zuerst)"""
+    try:
+        aufnahmen_dir = 'aufnahmen'
+        if not os.path.exists(aufnahmen_dir):
+            return {'success': True, 'recordings': []}
+        
+        recordings = []
+        
+        # Durchlaufe alle Dateien rekursiv
+        for root, dirs, files in os.walk(aufnahmen_dir):
+            for file in files:
+                if file.endswith('.mp4'):
+                    file_path = os.path.join(root, file)
+                    try:
+                        # Hole Datei-Informationen
+                        stat = os.stat(file_path)
+                        file_size = stat.st_size
+                        file_mtime = stat.st_mtime
+                        
+                        # Extrahiere Kamera-Info aus Dateinamen (Format: IP_PORT_YYYY-MM-DD_HH-MM-SS.mp4)
+                        filename_parts = file.replace('.mp4', '').split('_')
+                        camera_info = 'Unbekannt'
+                        if len(filename_parts) >= 2:
+                            camera_info = f"{filename_parts[0]}:{filename_parts[1]}"
+                        
+                        # Relativer Pfad für URL
+                        rel_path = os.path.relpath(file_path, aufnahmen_dir)
+                        
+                        recordings.append({
+                            'filename': rel_path.replace('\\', '/'),  # Windows-kompatibel
+                            'path': file_path,
+                            'size': file_size,
+                            'timestamp': file_mtime,
+                            'camera': camera_info
+                        })
+                    except Exception as e:
+                        logger.error(f"Fehler beim Lesen von {file_path}: {e}")
+                        continue
+        
+        # Sortiere nach Timestamp (neueste zuerst)
+        recordings.sort(key=lambda x: x['timestamp'], reverse=True)
+        
+        # Limitiere auf die letzten 100 Aufnahmen
+        recordings = recordings[:100]
+        
+        return {'success': True, 'recordings': recordings}
+        
+    except Exception as e:
+        logger.error(f"Fehler beim Abrufen der Aufnahmen: {e}")
+        return {'success': False, 'message': str(e)}, 500
+
+
+@app.route('/api/recordings/play/<path:filename>')
+def play_recording(filename):
+    """Streamt eine Aufnahme-Datei für Video-Player"""
+    try:
+        # Sicherheitscheck: Nur Dateien aus aufnahmen-Ordner
+        safe_path = os.path.join('aufnahmen', filename)
+        safe_path = os.path.normpath(safe_path)
+        
+        if not safe_path.startswith(os.path.normpath('aufnahmen')):
+            return {'error': 'Ungültiger Pfad'}, 403
+        
+        if not os.path.exists(safe_path):
+            return {'error': 'Datei nicht gefunden'}, 404
+        
+        from flask import send_file
+        return send_file(safe_path, mimetype='video/mp4')
+        
+    except Exception as e:
+        logger.error(f"Fehler beim Abspielen der Aufnahme: {e}")
+        return {'error': str(e)}, 500
+
+
+@app.route('/api/recordings/download/<path:filename>')
+def download_recording(filename):
+    """Lädt eine Aufnahme-Datei herunter"""
+    try:
+        # Sicherheitscheck: Nur Dateien aus aufnahmen-Ordner
+        safe_path = os.path.join('aufnahmen', filename)
+        safe_path = os.path.normpath(safe_path)
+        
+        if not safe_path.startswith(os.path.normpath('aufnahmen')):
+            return {'error': 'Ungültiger Pfad'}, 403
+        
+        if not os.path.exists(safe_path):
+            return {'error': 'Datei nicht gefunden'}, 404
+        
+        from flask import send_file
+        return send_file(safe_path, as_attachment=True, download_name=os.path.basename(filename))
+        
+    except Exception as e:
+        logger.error(f"Fehler beim Download der Aufnahme: {e}")
+        return {'error': str(e)}, 500
+
+
 def get_camera_stream(camera_index):
     """Generator für Video-Stream von einer Kamera"""
     if camera_index >= len(found_cameras):
@@ -1213,8 +1747,16 @@ if __name__ == '__main__':
     import atexit
     
     # Registriere Signal-Handler für sauberes Beenden
+    # Windows unterstützt nur SIGINT, nicht SIGTERM
     signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    if platform.system() != 'Windows':
+        signal.signal(signal.SIGTERM, signal_handler)
+    else:
+        # Auf Windows: SIGBREAK als Alternative (falls verfügbar)
+        try:
+            signal.signal(signal.SIGBREAK, signal_handler)
+        except AttributeError:
+            pass  # SIGBREAK nicht verfügbar
     
     # Registriere Cleanup-Funktionen
     atexit.register(cleanup_recordings)
