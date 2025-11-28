@@ -10,6 +10,9 @@ import signal
 import sys
 import tempfile
 import platform
+import webbrowser
+import subprocess
+import shutil
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from onvif import ONVIFCamera, ONVIFError
@@ -47,6 +50,13 @@ VIDEO_QUALITY = 65  # Qualität für Video-Aufnahmen (0-100, höher = bessere Qu
 camera_username = 'admin'
 camera_password = '123456'
 credentials_lock = threading.Lock()
+
+# Aufnahme-Einstellungen
+record_half_resolution = True  # True = halbierte Auflösung für Aufnahmen (Standard: True)
+
+# FFmpeg Verfügbarkeit
+ffmpeg_available = None
+ffmpeg_path = None
 
 # HTML Template für die Web-Oberfläche
 HTML_TEMPLATE = """
@@ -413,6 +423,78 @@ HTML_TEMPLATE = """
             color: #aaa;
         }
         
+        .date-group {
+            margin-bottom: 25px;
+            border: 1px solid #555;
+            border-radius: 8px;
+            overflow: hidden;
+            background: #2a2a2a;
+        }
+        
+        .date-header {
+            background: #333;
+            padding: 15px 20px;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 2px solid #4CAF50;
+            transition: background 0.3s;
+        }
+        
+        .date-header:hover {
+            background: #3a3a3a;
+        }
+        
+        .date-header h3 {
+            margin: 0;
+            color: #4CAF50;
+            font-size: 1.3em;
+        }
+        
+        .date-content {
+            padding: 15px;
+        }
+        
+        .time-group {
+            margin-bottom: 20px;
+            border: 1px solid #444;
+            border-radius: 6px;
+            overflow: hidden;
+            background: #1f1f1f;
+        }
+        
+        .time-header {
+            background: #2a2a2a;
+            padding: 12px 15px;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #444;
+            transition: background 0.3s;
+        }
+        
+        .time-header:hover {
+            background: #333;
+        }
+        
+        .time-header h4 {
+            margin: 0;
+            color: #fff;
+            font-size: 1em;
+        }
+        
+        .time-content {
+            padding: 15px;
+        }
+        
+        .toggle-icon {
+            color: #4CAF50;
+            font-size: 0.9em;
+            transition: transform 0.3s;
+        }
+        
         @media (max-width: 768px) {
             .grid {
                 grid-template-columns: 1fr;
@@ -457,6 +539,12 @@ HTML_TEMPLATE = """
                 <div class="form-group">
                     <label for="password">Passwort:</label>
                     <input type="password" id="password" name="password" required>
+                </div>
+                <div class="form-group">
+                    <label style="display: flex; align-items: center; cursor: pointer;">
+                        <input type="checkbox" id="halfResolution" name="halfResolution" style="width: auto; margin-right: 10px; cursor: pointer;">
+                        <span>Auflösung für Aufnahmen halbieren (kleinere Dateien, weniger Speicher)</span>
+                    </label>
                 </div>
                 <div class="form-actions">
                     <button type="button" class="btn-secondary" onclick="closeSettings()">Abbrechen</button>
@@ -507,6 +595,7 @@ HTML_TEMPLATE = """
                             <span id="record-text-{{ loop.index0 }}">⏺ Aufnahme starten</span>
                         </button>
                         <span id="record-status-{{ loop.index0 }}" class="record-status"></span>
+                        <span id="record-mode-{{ loop.index0 }}" class="record-mode" style="font-size: 0.8em; color: #aaa; margin-left: 10px;"></span>
                     </div>
                 </div>
                 <div class="video-container">
@@ -569,13 +658,18 @@ HTML_TEMPLATE = """
             event.preventDefault();
             const username = document.getElementById('username').value;
             const password = document.getElementById('password').value;
+            const halfResolution = document.getElementById('halfResolution').checked;
             
             fetch('/api/credentials', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
                 },
-                body: JSON.stringify({username: username, password: password})
+                body: JSON.stringify({
+                    username: username, 
+                    password: password,
+                    half_resolution: halfResolution
+                })
             })
                 .then(response => response.json())
                 .then(data => {
@@ -621,8 +715,17 @@ HTML_TEMPLATE = """
             fetch('/api/recordings')
                 .then(response => response.json())
                 .then(data => {
-                    if (data.success && data.recordings && data.recordings.length > 0) {
-                        displayRecordings(data.recordings);
+                    if (data.success && data.recordings) {
+                        // Prüfe ob Array oder Objekt (gruppiert)
+                        const hasRecordings = Array.isArray(data.recordings) 
+                            ? data.recordings.length > 0 
+                            : Object.keys(data.recordings).length > 0;
+                        
+                        if (hasRecordings) {
+                            displayRecordings(data);
+                        } else {
+                            list.innerHTML = '<div class="no-recordings"><p>Keine Aufnahmen gefunden</p></div>';
+                        }
                     } else {
                         list.innerHTML = '<div class="no-recordings"><p>Keine Aufnahmen gefunden</p></div>';
                     }
@@ -633,33 +736,119 @@ HTML_TEMPLATE = """
                 });
         }
         
-        function displayRecordings(recordings) {
+        function displayRecordings(data) {
             const list = document.getElementById('recordingsList');
-            let html = '<div class="recordings-grid">';
+            let html = '';
             
-            recordings.forEach(recording => {
-                const date = new Date(recording.timestamp * 1000).toLocaleString('de-DE');
-                html += `
-                    <div class="recording-item">
-                        <div class="recording-info">
-                            <h4>${recording.camera || recording.filename}</h4>
-                            <p>📅 ${date}</p>
-                            <p>💾 ${(recording.size / (1024 * 1024)).toFixed(2)} MB</p>
-                            <p>📍 ${recording.filename}</p>
+            // Prüfe ob alte Format (Array) oder neues Format (gruppiert)
+            if (Array.isArray(data.recordings)) {
+                // Fallback für altes Format
+                html = '<div class="recordings-grid">';
+                data.recordings.forEach(recording => {
+                    const date = new Date(recording.timestamp * 1000).toLocaleString('de-DE');
+                    html += createRecordingItem(recording, date);
+                });
+                html += '</div>';
+            } else {
+                // Neues Format: gruppiert nach Datum und Stunden-Bereich
+                const recordings = data.recordings;
+                
+                for (const date in recordings) {
+                    const dateRecordings = recordings[date];
+                    const dateObj = new Date(date + 'T00:00:00');
+                    const dateFormatted = dateObj.toLocaleDateString('de-DE', { 
+                        weekday: 'long', 
+                        year: 'numeric', 
+                        month: 'long', 
+                        day: 'numeric' 
+                    });
+                    
+                    html += `
+                        <div class="date-group">
+                            <div class="date-header" onclick="toggleDateGroup('${date}')">
+                                <h3>📅 ${dateFormatted} (${date})</h3>
+                                <span class="toggle-icon" id="toggle-${date}">▼</span>
+                            </div>
+                            <div class="date-content" id="content-${date}">
+                    `;
+                    
+                    for (const timeRange in dateRecordings) {
+                        const timeRecordings = dateRecordings[timeRange];
+                        const timeRangeFormatted = timeRange.replace('_', ' - ');
+                        
+                        html += `
+                            <div class="time-group">
+                                <div class="time-header" onclick="toggleTimeGroup('${date}-${timeRange}')">
+                                    <h4>🕐 ${timeRangeFormatted} Uhr (${timeRecordings.length} Aufnahme${timeRecordings.length !== 1 ? 'n' : ''})</h4>
+                                    <span class="toggle-icon" id="toggle-${date}-${timeRange}">▼</span>
+                                </div>
+                                <div class="time-content" id="content-${date}-${timeRange}">
+                                    <div class="recordings-grid">
+                        `;
+                        
+                        timeRecordings.forEach(recording => {
+                            const dateTime = new Date(recording.timestamp * 1000).toLocaleString('de-DE');
+                            html += createRecordingItem(recording, dateTime);
+                        });
+                        
+                        html += `
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    }
+                    
+                    html += `
+                            </div>
                         </div>
-                        <video class="recording-video" controls preload="metadata">
-                            <source src="/api/recordings/play/${encodeURIComponent(recording.filename)}" type="video/mp4">
-                            Ihr Browser unterstützt das Video-Tag nicht.
-                        </video>
-                        <div class="recording-actions">
-                            <a href="/api/recordings/download/${encodeURIComponent(recording.filename)}" class="btn btn-small" download>⬇️ Download</a>
-                        </div>
-                    </div>
-                `;
-            });
+                    `;
+                }
+            }
             
-            html += '</div>';
             list.innerHTML = html;
+        }
+        
+        function createRecordingItem(recording, dateTime) {
+            return `
+                <div class="recording-item">
+                    <div class="recording-info">
+                        <h4>${recording.camera || recording.filename}</h4>
+                        <p>📅 ${dateTime}</p>
+                        <p>💾 ${(recording.size / (1024 * 1024)).toFixed(2)} MB</p>
+                    </div>
+                    <video class="recording-video" controls preload="metadata">
+                        <source src="/api/recordings/play/${encodeURIComponent(recording.filename)}" type="video/mp4">
+                        Ihr Browser unterstützt das Video-Tag nicht.
+                    </video>
+                    <div class="recording-actions">
+                        <a href="/api/recordings/download/${encodeURIComponent(recording.filename)}" class="btn btn-small" download>⬇️ Download</a>
+                    </div>
+                </div>
+            `;
+        }
+        
+        function toggleDateGroup(date) {
+            const content = document.getElementById(`content-${date}`);
+            const toggle = document.getElementById(`toggle-${date}`);
+            if (content.style.display === 'none') {
+                content.style.display = 'block';
+                toggle.textContent = '▼';
+            } else {
+                content.style.display = 'none';
+                toggle.textContent = '▶';
+            }
+        }
+        
+        function toggleTimeGroup(id) {
+            const content = document.getElementById(`content-${id}`);
+            const toggle = document.getElementById(`toggle-${id}`);
+            if (content.style.display === 'none') {
+                content.style.display = 'block';
+                toggle.textContent = '▼';
+            } else {
+                content.style.display = 'none';
+                toggle.textContent = '▶';
+            }
         }
         
         function toggleRecording(cameraIndex) {
@@ -712,6 +901,7 @@ HTML_TEMPLATE = """
                         const btn = document.getElementById(`record-btn-${idx}`);
                         const text = document.getElementById(`record-text-${idx}`);
                         const statusEl = document.getElementById(`record-status-${idx}`);
+                        const modeEl = document.getElementById(`record-mode-${idx}`);
                         
                         if (!btn || !text || !statusEl) continue;
                         
@@ -727,11 +917,24 @@ HTML_TEMPLATE = """
                                 const secs = duration % 60;
                                 statusEl.textContent = `⏺ ${mins}:${secs.toString().padStart(2, '0')}`;
                             }
+                            // Zeige Aufnahme-Modus (FFmpeg oder OpenCV)
+                            if (modeEl) {
+                                if (status.use_ffmpeg) {
+                                    modeEl.textContent = '🎤 FFmpeg (mit Audio)';
+                                    modeEl.style.color = '#4CAF50';
+                                } else {
+                                    modeEl.textContent = '📹 OpenCV (ohne Audio)';
+                                    modeEl.style.color = '#ff9800';
+                                }
+                            }
                         } else {
                             if (btn.classList.contains('recording')) {
                                 btn.classList.remove('recording');
                                 text.textContent = '⏺ Aufnahme starten';
                                 statusEl.textContent = '';
+                            }
+                            if (modeEl) {
+                                modeEl.textContent = '';
                             }
                         }
                     }
@@ -744,6 +947,86 @@ HTML_TEMPLATE = """
 </body>
 </html>
 """
+
+
+def check_ffmpeg():
+    """Prüft ob FFmpeg verfügbar ist und gibt den Pfad zurück
+    Sucht zuerst im System-PATH, dann im lokalen Programmordner"""
+    global ffmpeg_available, ffmpeg_path
+    
+    if ffmpeg_available is not None:
+        return ffmpeg_available, ffmpeg_path
+    
+    # Prüfe ob ffmpeg im PATH verfügbar ist
+    ffmpeg_cmd = shutil.which('ffmpeg')
+    if ffmpeg_cmd:
+        # Teste ob FFmpeg funktioniert
+        try:
+            result = subprocess.run([ffmpeg_cmd, '-version'], 
+                                  capture_output=True, 
+                                  timeout=5)
+            if result.returncode == 0:
+                ffmpeg_available = True
+                ffmpeg_path = ffmpeg_cmd
+                logger.info(f"FFmpeg gefunden im PATH: {ffmpeg_path}")
+                return True, ffmpeg_path
+        except:
+            pass
+    
+    # Prüfe lokale FFmpeg-Binaries im Programmordner
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    local_ffmpeg_paths = []
+    
+    # Windows: Prüfe verschiedene mögliche Pfade
+    if platform.system() == 'Windows':
+        local_ffmpeg_paths = [
+            os.path.join(script_dir, 'ffmpeg', 'bin', 'ffmpeg.exe'),
+            os.path.join(script_dir, 'ffmpeg', 'ffmpeg.exe'),
+            os.path.join(script_dir, 'ffmpeg.exe'),
+        ]
+    else:
+        # macOS/Linux: Prüfe verschiedene mögliche Pfade
+        local_ffmpeg_paths = [
+            os.path.join(script_dir, 'ffmpeg', 'bin', 'ffmpeg'),
+            os.path.join(script_dir, 'ffmpeg', 'ffmpeg'),
+            os.path.join(script_dir, 'ffmpeg'),
+        ]
+    
+    # Teste lokale Pfade
+    for local_path in local_ffmpeg_paths:
+        if os.path.exists(local_path) and os.path.isfile(local_path):
+            # Prüfe ob es ausführbar ist (bei Unix)
+            if platform.system() != 'Windows':
+                if not os.access(local_path, os.X_OK):
+                    continue
+            
+            # Teste ob FFmpeg funktioniert
+            try:
+                result = subprocess.run([local_path, '-version'], 
+                                      capture_output=True, 
+                                      timeout=5)
+                if result.returncode == 0:
+                    ffmpeg_available = True
+                    ffmpeg_path = local_path
+                    logger.info(f"FFmpeg gefunden im lokalen Ordner: {ffmpeg_path}")
+                    return True, ffmpeg_path
+            except Exception as e:
+                logger.debug(f"Lokaler FFmpeg-Pfad funktioniert nicht: {local_path} - {e}")
+                continue
+    
+    ffmpeg_available = False
+    ffmpeg_path = None
+    logger.warning("FFmpeg nicht gefunden - Audio-Aufnahme nicht verfügbar")
+    logger.info("Hinweis: Sie können FFmpeg-Binaries in den Programmordner legen:")
+    if platform.system() == 'Windows':
+        logger.info("  - ffmpeg/bin/ffmpeg.exe")
+        logger.info("  - ffmpeg/ffmpeg.exe")
+        logger.info("  - ffmpeg.exe (direkt im Programmordner)")
+    else:
+        logger.info("  - ffmpeg/bin/ffmpeg")
+        logger.info("  - ffmpeg/ffmpeg")
+        logger.info("  - ffmpeg (direkt im Programmordner)")
+    return False, None
 
 
 def get_local_network():
@@ -776,9 +1059,10 @@ def test_onvif_connection(host, port, username, password):
         return False, None, None
 
 
-def get_stream_uri(camera, username, password):
+def get_stream_uri(camera, username, password, use_sub_stream=False):
     """Holt die RTSP-Streaming-URL direkt von der ONVIF-Kamera über die Media Service API
-    Wählt das Profil mit der höchsten Auflösung (Main-Stream)"""
+    use_sub_stream=True: Wählt das Profil mit der niedrigsten Auflösung (Sub-Stream) für Live-Vorschau
+    use_sub_stream=False: Wählt das Profil mit der höchsten Auflösung (Main-Stream) für Aufnahmen"""
     try:
         # Erstelle Media Service (bereits authentifiziert über camera-Objekt)
         media_service = camera.create_media_service()
@@ -790,56 +1074,92 @@ def get_stream_uri(camera, username, password):
             logger.warning("Keine Profile von ONVIF-Kamera gefunden")
             return None
         
-        # Finde das Profil mit der höchsten Auflösung (Main-Stream)
+        # Finde das Profil mit der höchsten oder niedrigsten Auflösung je nach use_sub_stream
         best_profile = None
-        max_resolution = 0  # Starte mit 0, suche Maximum
-        
-        for profile in profiles:
-            try:
-                # Versuche VideoEncoderConfiguration zu holen
-                video_config = None
+        if use_sub_stream:
+            # Suche niedrigste Auflösung (Sub-Stream)
+            min_resolution = float('inf')
+            for profile in profiles:
                 try:
-                    # Hole VideoEncoderConfiguration für dieses Profil
-                    if hasattr(profile, 'VideoEncoderConfiguration') and profile.VideoEncoderConfiguration:
-                        video_config_token = profile.VideoEncoderConfiguration.token
-                        video_config = media_service.GetVideoEncoderConfiguration({'ConfigurationToken': video_config_token})
-                except Exception as e:
-                    logger.debug(f"Konnte VideoEncoderConfiguration nicht holen: {e}")
-                    continue
-                
-                if video_config:
-                    # Berechne Auflösung (Breite * Höhe)
-                    width = 0
-                    height = 0
-                    
+                    video_config = None
                     try:
-                        # Versuche Resolution zu extrahieren
-                        if hasattr(video_config, 'Resolution'):
-                            res = video_config.Resolution
-                            if hasattr(res, 'Width'):
-                                width = int(res.Width) if res.Width else 0
-                            if hasattr(res, 'Height'):
-                                height = int(res.Height) if res.Height else 0
+                        if hasattr(profile, 'VideoEncoderConfiguration') and profile.VideoEncoderConfiguration:
+                            video_config_token = profile.VideoEncoderConfiguration.token
+                            video_config = media_service.GetVideoEncoderConfiguration({'ConfigurationToken': video_config_token})
                     except Exception as e:
-                        logger.debug(f"Konnte Resolution nicht extrahieren: {e}")
+                        logger.debug(f"Konnte VideoEncoderConfiguration nicht holen: {e}")
+                        continue
                     
-                    if width > 0 and height > 0:
-                        resolution = width * height
+                    if video_config:
+                        width = 0
+                        height = 0
+                        try:
+                            if hasattr(video_config, 'Resolution'):
+                                res = video_config.Resolution
+                                if hasattr(res, 'Width'):
+                                    width = int(res.Width) if res.Width else 0
+                                if hasattr(res, 'Height'):
+                                    height = int(res.Height) if res.Height else 0
+                        except Exception as e:
+                            logger.debug(f"Konnte Resolution nicht extrahieren: {e}")
                         
-                        if resolution > max_resolution:
-                            max_resolution = resolution
-                            best_profile = profile
-                            logger.debug(f"Neues bestes Profil (höchste Auflösung) gefunden: {width}x{height} (Auflösung: {resolution})")
-            except Exception as e:
-                logger.debug(f"Fehler beim Prüfen des Profils: {e}")
-                continue
-        
-        # Falls kein Profil mit Auflösung gefunden wurde, verwende das erste (meist Main-Stream)
-        if best_profile is None:
-            logger.info("Konnte Auflösungen nicht ermitteln, verwende erstes Profil (meist Main-Stream)")
-            best_profile = profiles[0]
+                        if width > 0 and height > 0:
+                            resolution = width * height
+                            if resolution < min_resolution:
+                                min_resolution = resolution
+                                best_profile = profile
+                                logger.debug(f"Neues bestes Profil (niedrigste Auflösung) gefunden: {width}x{height} (Auflösung: {resolution})")
+                except Exception as e:
+                    logger.debug(f"Fehler beim Prüfen des Profils: {e}")
+                    continue
+            
+            if best_profile is None:
+                logger.info("Konnte Auflösungen nicht ermitteln, verwende letztes Profil (meist Sub-Stream)")
+                best_profile = profiles[-1] if len(profiles) > 1 else profiles[0]
+            else:
+                logger.info(f"Verwende Profil mit niedrigster Auflösung: {min_resolution} Pixel (Sub-Stream)")
         else:
-            logger.info(f"Verwende Profil mit höchster Auflösung: {max_resolution} Pixel (Main-Stream)")
+            # Suche höchste Auflösung (Main-Stream)
+            max_resolution = 0
+            for profile in profiles:
+                try:
+                    video_config = None
+                    try:
+                        if hasattr(profile, 'VideoEncoderConfiguration') and profile.VideoEncoderConfiguration:
+                            video_config_token = profile.VideoEncoderConfiguration.token
+                            video_config = media_service.GetVideoEncoderConfiguration({'ConfigurationToken': video_config_token})
+                    except Exception as e:
+                        logger.debug(f"Konnte VideoEncoderConfiguration nicht holen: {e}")
+                        continue
+                    
+                    if video_config:
+                        width = 0
+                        height = 0
+                        try:
+                            if hasattr(video_config, 'Resolution'):
+                                res = video_config.Resolution
+                                if hasattr(res, 'Width'):
+                                    width = int(res.Width) if res.Width else 0
+                                if hasattr(res, 'Height'):
+                                    height = int(res.Height) if res.Height else 0
+                        except Exception as e:
+                            logger.debug(f"Konnte Resolution nicht extrahieren: {e}")
+                        
+                        if width > 0 and height > 0:
+                            resolution = width * height
+                            if resolution > max_resolution:
+                                max_resolution = resolution
+                                best_profile = profile
+                                logger.debug(f"Neues bestes Profil (höchste Auflösung) gefunden: {width}x{height} (Auflösung: {resolution})")
+                except Exception as e:
+                    logger.debug(f"Fehler beim Prüfen des Profils: {e}")
+                    continue
+            
+            if best_profile is None:
+                logger.info("Konnte Auflösungen nicht ermitteln, verwende erstes Profil (meist Main-Stream)")
+                best_profile = profiles[0]
+            else:
+                logger.info(f"Verwende Profil mit höchster Auflösung: {max_resolution} Pixel (Main-Stream)")
         
         profile = best_profile
         
@@ -921,13 +1241,20 @@ def scan_camera(host, port, username, password):
         return None
     
     try:
-        # Hole Stream URL per SOAP (bereits authentifiziert)
-        stream_url = get_stream_uri(camera, username, password)
+        # Hole Main-Stream URL per SOAP für Aufnahmen (höchste Auflösung)
+        stream_url = get_stream_uri(camera, username, password, use_sub_stream=False)
+        
+        # Hole Sub-Stream URL per SOAP für Live-Vorschau (niedrigste Auflösung)
+        live_stream_url = get_stream_uri(camera, username, password, use_sub_stream=True)
         
         # Wenn keine Stream-URL abgerufen werden konnte, Kamera nicht anzeigen
         if not stream_url:
             logger.debug(f"Keine Stream-URL für {host}:{port} - Kamera wird nicht angezeigt")
             return None
+        
+        # Verwende Sub-Stream als Fallback für Live-Vorschau falls verfügbar
+        if not live_stream_url:
+            live_stream_url = stream_url
         
         # Hole Device-Informationen
         device_name = f"Kamera {host}"
@@ -949,12 +1276,14 @@ def scan_camera(host, port, username, password):
             'host': host,
             'port': port,
             'name': device_name,
-            'stream_url': stream_url,
+            'stream_url': stream_url,  # Main-Stream für Aufnahmen
+            'live_stream_url': live_stream_url,  # Sub-Stream für Live-Vorschau
             'device_info': device_info
         }
         
         logger.info(f"✓ Kamera gefunden (SOAP-Auth erfolgreich): {host}:{port} - {device_name}")
-        logger.info(f"  RTSP-URL von ONVIF-Schnittstelle: {stream_url}")
+        logger.info(f"  Main-Stream (Aufnahme): {stream_url}")
+        logger.info(f"  Sub-Stream (Live-Vorschau): {live_stream_url}")
         return camera_info
         
     except Exception as e:
@@ -1234,19 +1563,44 @@ def start_recording(camera_index):
             if width <= 0 or height <= 0:
                 width, height = 1920, 1080  # Standard HD
             
+            # Berechne Aufnahme-Auflösung basierend auf Einstellung
+            with credentials_lock:
+                use_half_resolution = record_half_resolution
+            
+            if use_half_resolution:
+                recording_width = width // 2
+                recording_height = height // 2
+                logger.info(f"Aufnahme mit halbierter Auflösung: {recording_width}x{recording_height} (Original: {width}x{height})")
+            else:
+                recording_width = width
+                recording_height = height
+            
+            # Prüfe ob FFmpeg verfügbar ist
+            ffmpeg_avail, _ = check_ffmpeg()
+            
             # Initialisiere Aufnahme-Status
-            # Der VideoWriter wird im record_camera Thread erstellt für bessere Segmentierung
             recording_status[camera_index] = {
                 'recording': True,
-                'writer': None,  # Wird im Thread erstellt
+                'writer': None,  # Wird im Thread erstellt (OpenCV)
+                'ffmpeg_process': None,  # Wird im Thread erstellt (FFmpeg)
                 'filename': filename,
                 'cap': cap,
-                'start_time': datetime.now()
+                'start_time': datetime.now(),
+                'recording_width': recording_width,
+                'recording_height': recording_height,
+                'original_width': width,
+                'original_height': height,
+                'use_ffmpeg': ffmpeg_avail
             }
             recording_locks[camera_index] = threading.Lock()
             
-            # Starte Aufnahme-Thread
-            thread = threading.Thread(target=record_camera, args=(camera_index,), daemon=True)
+            # Starte Aufnahme-Thread (FFmpeg wenn verfügbar, sonst OpenCV)
+            if ffmpeg_avail:
+                thread = threading.Thread(target=record_camera_ffmpeg, args=(camera_index,), daemon=True)
+                logger.info(f"Aufnahme mit FFmpeg (mit Audio) gestartet für Kamera {camera_index}")
+            else:
+                thread = threading.Thread(target=record_camera_opencv, args=(camera_index,), daemon=True)
+                logger.info(f"Aufnahme mit OpenCV (ohne Audio) gestartet für Kamera {camera_index}")
             thread.start()
             
             logger.info(f"Aufnahme gestartet für Kamera {camera_index}: {filename}")
@@ -1257,8 +1611,217 @@ def start_recording(camera_index):
             return False, str(e)
 
 
-def record_camera(camera_index):
-    """Aufnahme-Thread für eine Kamera - mit robuster Segmentierung für Crash-Sicherheit"""
+def record_camera_ffmpeg(camera_index):
+    """Aufnahme-Thread für eine Kamera mit FFmpeg (unterstützt Audio)"""
+    status = recording_status.get(camera_index)
+    if not status:
+        return
+    
+    camera = found_cameras[camera_index]
+    stream_url = camera.get('stream_url')
+    host = camera.get('host')
+    port = camera.get('port')
+    
+    # Prüfe ob FFmpeg verfügbar ist
+    ffmpeg_avail, ffmpeg_cmd = check_ffmpeg()
+    if not ffmpeg_avail:
+        logger.error("FFmpeg nicht verfügbar - verwende OpenCV ohne Audio")
+        # Fallback auf OpenCV
+        record_camera_opencv(camera_index)
+        return
+    
+    # Hole Aufnahme-Auflösung aus Status
+    recording_width = status.get('recording_width', 1920)
+    recording_height = status.get('recording_height', 1080)
+    
+    # Segmentierung: Neue Datei alle 10 Minuten
+    segment_duration = 600  # 10 Minuten in Sekunden
+    segment_start_time = datetime.now()
+    current_process = None
+    current_filename = None
+    segment_index = 0
+    
+    def create_new_segment():
+        """Erstellt ein neues Video-Segment mit FFmpeg"""
+        nonlocal current_process, current_filename, segment_start_time, segment_index
+        
+        # Stoppe alte Aufnahme
+        if current_process is not None:
+            try:
+                # Sende 'q' Signal um FFmpeg sauber zu beenden
+                # Warte länger damit FFmpeg die Datei vollständig schließen kann
+                current_process.stdin.write(b'q\n')
+                current_process.stdin.flush()
+                current_process.wait(timeout=10)  # Mehr Zeit für sauberes Beenden
+            except subprocess.TimeoutExpired:
+                # Falls FFmpeg nicht sauber beendet, versuche terminate
+                logger.warning(f"FFmpeg beendete sich nicht sauber, verwende terminate")
+                try:
+                    current_process.terminate()
+                    current_process.wait(timeout=5)
+                except:
+                    try:
+                        current_process.kill()
+                    except:
+                        pass
+            except:
+                try:
+                    current_process.terminate()
+                    current_process.wait(timeout=2)
+                except:
+                    try:
+                        current_process.kill()
+                    except:
+                        pass
+            # Prüfe ob Datei existiert und nicht leer ist
+            if current_filename and os.path.exists(current_filename):
+                file_size = os.path.getsize(current_filename)
+                if file_size < 1024:  # Weniger als 1KB = wahrscheinlich korrupt
+                    logger.warning(f"Segment-Datei sehr klein ({file_size} bytes), möglicherweise korrupt: {current_filename}")
+                else:
+                    logger.debug(f"Segment beendet: {current_filename} ({file_size} bytes)")
+        
+        # Erstelle neue Datei
+        current_filename = get_recording_filename(host, port)
+        # Füge Segment-Index hinzu falls Datei bereits existiert
+        if os.path.exists(current_filename):
+            base, ext = os.path.splitext(current_filename)
+            current_filename = f"{base}_{segment_index}{ext}"
+            segment_index += 1
+        
+        # FFmpeg-Befehl für RTSP-Aufnahme mit Audio
+        # -rtsp_transport tcp: Stabilere Verbindung
+        # -i: Input RTSP-Stream
+        # -vf scale: Video-Skalierung (falls halbierte Auflösung)
+        # -c:v libx264: H.264 Video-Codec
+        # -preset medium: Encoding-Geschwindigkeit
+        # -crf 23: Qualität (entspricht etwa VIDEO_QUALITY 65)
+        # -c:a aac: AAC Audio-Codec
+        # -b:a 128k: Audio-Bitrate
+        # -f mp4: MP4 Format
+        # -movflags +faststart: Schnelleres Abspielen
+        # -y: Überschreibe Datei falls vorhanden
+        
+        ffmpeg_args = [
+            ffmpeg_cmd,
+            '-rtsp_transport', 'tcp',  # Stabilere RTSP-Verbindung
+            '-i', stream_url,
+        ]
+        
+        # Füge Video-Skalierung hinzu falls halbierte Auflösung
+        original_width = status.get('original_width', recording_width * 2)
+        original_height = status.get('original_height', recording_height * 2)
+        if recording_width < original_width or recording_height < original_height:
+            # Füge Scale-Filter hinzu
+            scale_filter = f'scale={recording_width}:{recording_height}'
+            ffmpeg_args.extend(['-vf', scale_filter])
+        
+        # Video- und Audio-Codec-Einstellungen
+        # Verwende fragmentierte MP4s (+empty_moov+default_base_moof) damit Dateien
+        # während der Aufnahme abspielbar sind und nicht korrupt werden
+        ffmpeg_args.extend([
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '23',  # Qualität (entspricht etwa VIDEO_QUALITY 65)
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-f', 'mp4',
+            '-movflags', '+empty_moov+default_base_moof',  # Fragmentierte MP4s - abspielbar während Aufnahme
+            '-frag_duration', '1',  # Fragment alle 1 Sekunde für bessere Abspielbarkeit
+            '-y',  # Überschreibe Datei
+            current_filename
+        ])
+        
+        try:
+            # Starte FFmpeg-Prozess
+            current_process = subprocess.Popen(
+                ffmpeg_args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0
+            )
+            
+            segment_start_time = datetime.now()
+            status['ffmpeg_process'] = current_process
+            status['filename'] = current_filename
+            logger.info(f"FFmpeg-Segment gestartet: {current_filename}")
+            return True
+        except Exception as e:
+            logger.error(f"Fehler beim Starten von FFmpeg: {e}")
+            return False
+    
+    # Erstelle erstes Segment
+    if not create_new_segment():
+        logger.error("Konnte erstes FFmpeg-Segment nicht erstellen")
+        return
+    
+    # Überwache Aufnahme und segmentiere alle 10 Minuten
+    while status['recording']:
+        try:
+            # Prüfe ob Prozess noch läuft
+            if current_process.poll() is not None:
+                # Prozess beendet (Fehler oder Stream-Ende)
+                logger.warning(f"FFmpeg-Prozess beendet (Returncode: {current_process.returncode})")
+                # Versuche neu zu verbinden
+                time.sleep(2)
+                if not create_new_segment():
+                    logger.error("Konnte FFmpeg-Segment nach Fehler nicht neu erstellen")
+                    break
+            
+            # Prüfe ob Segment-Wechsel nötig ist
+            elapsed = (datetime.now() - segment_start_time).total_seconds()
+            if elapsed >= segment_duration:
+                logger.info(f"Segment-Wechsel nach {elapsed:.0f}s (10 Minuten)")
+                if not create_new_segment():
+                    logger.error("Konnte neues Segment nicht erstellen")
+                    break
+            
+            time.sleep(1)  # Prüfe jede Sekunde
+            
+        except Exception as e:
+            logger.error(f"Fehler während FFmpeg-Aufnahme: {e}")
+            time.sleep(2)
+    
+    # Finales Cleanup
+    if current_process is not None:
+        try:
+            current_process.stdin.write(b'q\n')
+            current_process.stdin.flush()
+            current_process.wait(timeout=10)  # Mehr Zeit für sauberes Beenden
+        except subprocess.TimeoutExpired:
+            logger.warning(f"FFmpeg beendete sich nicht sauber beim Finalen Cleanup")
+            try:
+                current_process.terminate()
+                current_process.wait(timeout=5)
+            except:
+                try:
+                    current_process.kill()
+                except:
+                    pass
+        except:
+            try:
+                current_process.terminate()
+                current_process.wait(timeout=2)
+            except:
+                try:
+                    current_process.kill()
+                except:
+                    pass
+        
+        # Prüfe letzte Datei
+        if current_filename and os.path.exists(current_filename):
+            file_size = os.path.getsize(current_filename)
+            if file_size < 1024:
+                logger.warning(f"Letzte Segment-Datei sehr klein ({file_size} bytes), möglicherweise korrupt: {current_filename}")
+            else:
+                logger.info(f"Letztes Segment geschlossen: {current_filename} ({file_size} bytes)")
+    
+    logger.info(f"FFmpeg-Aufnahme beendet für Kamera {camera_index}")
+
+
+def record_camera_opencv(camera_index):
+    """Aufnahme-Thread für eine Kamera mit OpenCV (ohne Audio) - Fallback"""
     status = recording_status.get(camera_index)
     if not status:
         return
@@ -1276,9 +1839,12 @@ def record_camera(camera_index):
     if width <= 0 or height <= 0:
         width, height = 1920, 1080
     
-    # Segmentierung: Neue Datei alle 10 Minuten oder bei Dateigröße > 500MB
+    # Hole Aufnahme-Auflösung aus Status (wurde in start_recording gesetzt)
+    recording_width = status.get('recording_width', width)
+    recording_height = status.get('recording_height', height)
+    
+    # Segmentierung: Neue Datei alle 10 Minuten
     segment_duration = 600  # 10 Minuten in Sekunden
-    max_file_size = 500 * 1024 * 1024  # 500 MB
     frame_count = 0
     segment_start_time = datetime.now()
     current_writer = None
@@ -1307,7 +1873,7 @@ def record_camera(camera_index):
                 # Teste ob Codec funktioniert - verwende plattformunabhängigen temporären Pfad
                 temp_dir = tempfile.gettempdir()
                 test_file = os.path.join(temp_dir, f'test_codec_{os.getpid()}.mp4')
-                test_writer = cv2.VideoWriter(test_file, test_fourcc, fps, (width, height))
+                test_writer = cv2.VideoWriter(test_file, test_fourcc, fps, (recording_width, recording_height))
                 if test_writer.isOpened():
                     test_writer.release()
                     try:
@@ -1327,15 +1893,15 @@ def record_camera(camera_index):
             logger.warning("H.264 Codec nicht verfügbar, verwende mp4v")
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         
-        # Erstelle VideoWriter mit Qualitätsparameter
+        # Erstelle VideoWriter mit Qualitätsparameter und korrekter Aufnahme-Auflösung
         # Versuche Qualitätsparameter zu setzen (nicht alle Codecs unterstützen das)
         try:
-            current_writer = cv2.VideoWriter(current_filename, fourcc, fps, (width, height))
+            current_writer = cv2.VideoWriter(current_filename, fourcc, fps, (recording_width, recording_height))
             # Setze Qualität aus Konfiguration (0-100, höher = bessere Qualität, größere Datei)
             current_writer.set(cv2.VIDEOWRITER_PROP_QUALITY, VIDEO_QUALITY)
         except:
             # Fallback ohne Qualitätsparameter
-            current_writer = cv2.VideoWriter(current_filename, fourcc, fps, (width, height))
+            current_writer = cv2.VideoWriter(current_filename, fourcc, fps, (recording_width, recording_height))
         
         if not current_writer.isOpened():
             logger.error(f"Konnte VideoWriter nicht erstellen: {current_filename}")
@@ -1357,6 +1923,10 @@ def record_camera(camera_index):
         try:
             ret, frame = cap.read()
             if ret:
+                # Resize Frame falls halbierte Auflösung aktiviert
+                if recording_width != width or recording_height != height:
+                    frame = cv2.resize(frame, (recording_width, recording_height), interpolation=cv2.INTER_LINEAR)
+                
                 with lock:
                     current_writer.write(frame)
                     frame_count += 1
@@ -1370,12 +1940,11 @@ def record_camera(camera_index):
                         except:
                             pass
                     
-                    # Prüfe ob neues Segment nötig ist (Zeit oder Größe)
+                    # Prüfe ob neues Segment nötig ist (nur Zeit)
                     elapsed = (datetime.now() - segment_start_time).total_seconds()
-                    file_size = os.path.getsize(current_filename) if os.path.exists(current_filename) else 0
                     
-                    if elapsed >= segment_duration or file_size >= max_file_size:
-                        logger.info(f"Segment-Wechsel: Zeit={elapsed:.0f}s, Größe={file_size/(1024*1024):.1f}MB")
+                    if elapsed >= segment_duration:
+                        logger.info(f"Segment-Wechsel nach {elapsed:.0f}s (10 Minuten)")
                         if not create_new_segment():
                             logger.error("Konnte neues Segment nicht erstellen")
                             break
@@ -1422,6 +1991,47 @@ def stop_recording(camera_index):
     status['recording'] = False
     filename = status['filename']
     
+    # Stoppe FFmpeg-Prozess falls aktiv
+    if 'ffmpeg_process' in status and status['ffmpeg_process'] is not None:
+        try:
+            process = status['ffmpeg_process']
+            process.stdin.write(b'q\n')
+            process.stdin.flush()
+            process.wait(timeout=10)  # Mehr Zeit für sauberes Beenden
+        except subprocess.TimeoutExpired:
+            logger.warning(f"FFmpeg beendete sich nicht sauber beim Stoppen")
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except:
+                try:
+                    process.kill()
+                except:
+                    pass
+        except:
+            try:
+                process.terminate()
+                process.wait(timeout=2)
+            except:
+                try:
+                    process.kill()
+                except:
+                    pass
+    
+    # Stoppe OpenCV Writer falls aktiv
+    if 'writer' in status and status['writer'] is not None:
+        try:
+            status['writer'].release()
+        except:
+            pass
+    
+    # Schließe Video-Capture
+    if 'cap' in status and status['cap'] is not None:
+        try:
+            status['cap'].release()
+        except:
+            pass
+    
     # Warte kurz, damit Thread sauber beendet wird
     time.sleep(0.5)
     
@@ -1459,7 +2069,8 @@ def record_status():
             status[idx] = {
                 'recording': rec['recording'],
                 'filename': rec['filename'],
-                'start_time': rec['start_time'].isoformat()
+                'start_time': rec['start_time'].isoformat(),
+                'use_ffmpeg': rec.get('use_ffmpeg', False)  # Zeigt ob FFmpeg oder OpenCV verwendet wird
             }
         else:
             status[idx] = {'recording': False}
@@ -1468,18 +2079,19 @@ def record_status():
 
 @app.route('/api/credentials', methods=['GET'])
 def get_credentials():
-    """Gibt aktuelle Login-Daten zurück"""
+    """Gibt aktuelle Login-Daten und Einstellungen zurück"""
     with credentials_lock:
         return {
             'username': camera_username,
-            'password': '***'  # Passwort nicht zurückgeben aus Sicherheitsgründen
+            'password': '***',  # Passwort nicht zurückgeben aus Sicherheitsgründen
+            'half_resolution': record_half_resolution
         }
 
 
 @app.route('/api/credentials', methods=['POST'])
 def set_credentials():
-    """Setzt neue Login-Daten und verbindet Kameras neu"""
-    global camera_username, camera_password, found_cameras
+    """Setzt neue Login-Daten und Einstellungen und verbindet Kameras neu"""
+    global camera_username, camera_password, found_cameras, record_half_resolution
     
     try:
         from flask import request
@@ -1494,6 +2106,9 @@ def set_credentials():
         if not new_username or not new_password:
             return {'success': False, 'message': 'Username und Password dürfen nicht leer sein'}, 400
         
+        # Aktualisiere Auflösungseinstellung
+        new_half_resolution = data.get('half_resolution', False)
+        
         # Stoppe alle laufenden Aufnahmen
         logger.info("Stoppe alle laufenden Aufnahmen vor Credential-Änderung...")
         for camera_index in list(recording_status.keys()):
@@ -1502,12 +2117,14 @@ def set_credentials():
             except:
                 pass
         
-        # Aktualisiere Credentials
+        # Aktualisiere Credentials und Einstellungen
         with credentials_lock:
             camera_username = new_username
             camera_password = new_password
+            record_half_resolution = new_half_resolution
         
         logger.info(f"Login-Daten aktualisiert: {new_username}")
+        logger.info(f"Auflösungseinstellung: {'Halbierte Auflösung' if new_half_resolution else 'Volle Auflösung'}")
         
         # Starte neuen Scan mit neuen Credentials
         logger.info("Starte neuen Scan mit aktualisierten Credentials...")
@@ -1532,13 +2149,14 @@ def set_credentials():
 
 @app.route('/api/recordings', methods=['GET'])
 def get_recordings():
-    """Gibt Liste aller Aufnahmen zurück, sortiert nach Datum (neueste zuerst)"""
+    """Gibt Liste aller Aufnahmen zurück, gruppiert nach Datum und Stunden-Bereich"""
     try:
         aufnahmen_dir = 'aufnahmen'
         if not os.path.exists(aufnahmen_dir):
-            return {'success': True, 'recordings': []}
+            return {'success': True, 'recordings': {}}
         
-        recordings = []
+        # Struktur: {date: {time_range: [recordings]}}
+        recordings_by_time = {}
         
         # Durchlaufe alle Dateien rekursiv
         for root, dirs, files in os.walk(aufnahmen_dir):
@@ -1557,11 +2175,28 @@ def get_recordings():
                         if len(filename_parts) >= 2:
                             camera_info = f"{filename_parts[0]}:{filename_parts[1]}"
                         
-                        # Relativer Pfad für URL
+                        # Relativer Pfad für URL (Windows-kompatibel)
                         rel_path = os.path.relpath(file_path, aufnahmen_dir)
+                        rel_path = rel_path.replace('\\', '/')  # Windows zu Unix-Pfad
                         
-                        recordings.append({
-                            'filename': rel_path.replace('\\', '/'),  # Windows-kompatibel
+                        # Extrahiere Datum und Stunden-Bereich aus Pfad
+                        # Format: aufnahmen/YYYY-MM-DD/HH-MM_HH-MM/filename.mp4
+                        path_parts = rel_path.split('/')
+                        date_str = 'Unbekannt'
+                        time_range = 'Unbekannt'
+                        
+                        if len(path_parts) >= 3:
+                            date_str = path_parts[0]  # YYYY-MM-DD
+                            time_range = path_parts[1]  # HH-MM_HH-MM
+                        
+                        # Initialisiere Struktur falls nötig
+                        if date_str not in recordings_by_time:
+                            recordings_by_time[date_str] = {}
+                        if time_range not in recordings_by_time[date_str]:
+                            recordings_by_time[date_str][time_range] = []
+                        
+                        recordings_by_time[date_str][time_range].append({
+                            'filename': rel_path,
                             'path': file_path,
                             'size': file_size,
                             'timestamp': file_mtime,
@@ -1571,13 +2206,19 @@ def get_recordings():
                         logger.error(f"Fehler beim Lesen von {file_path}: {e}")
                         continue
         
-        # Sortiere nach Timestamp (neueste zuerst)
-        recordings.sort(key=lambda x: x['timestamp'], reverse=True)
+        # Sortiere innerhalb jeder Gruppe nach Timestamp (neueste zuerst)
+        for date in recordings_by_time:
+            for time_range in recordings_by_time[date]:
+                recordings_by_time[date][time_range].sort(key=lambda x: x['timestamp'], reverse=True)
         
-        # Limitiere auf die letzten 100 Aufnahmen
-        recordings = recordings[:100]
+        # Sortiere Datum und Zeit-Bereiche (neueste zuerst)
+        sorted_recordings = {}
+        for date in sorted(recordings_by_time.keys(), reverse=True):
+            sorted_recordings[date] = {}
+            for time_range in sorted(recordings_by_time[date].keys(), reverse=True):
+                sorted_recordings[date][time_range] = recordings_by_time[date][time_range]
         
-        return {'success': True, 'recordings': recordings}
+        return {'success': True, 'recordings': sorted_recordings}
         
     except Exception as e:
         logger.error(f"Fehler beim Abrufen der Aufnahmen: {e}")
@@ -1629,12 +2270,13 @@ def download_recording(filename):
 
 
 def get_camera_stream(camera_index):
-    """Generator für Video-Stream von einer Kamera"""
+    """Generator für Video-Stream von einer Kamera (verwendet Sub-Stream für Live-Vorschau)"""
     if camera_index >= len(found_cameras):
         return
     
     camera = found_cameras[camera_index]
-    stream_url = camera.get('stream_url')
+    # Verwende live_stream_url (Sub-Stream) für Live-Vorschau, Fallback auf stream_url
+    stream_url = camera.get('live_stream_url') or camera.get('stream_url')
     
     if not stream_url:
         return
@@ -1708,13 +2350,39 @@ def cleanup_recordings():
             status = recording_status[camera_index]
             if status['recording']:
                 status['recording'] = False
+                
+                # Stoppe FFmpeg-Prozess falls aktiv
+                if 'ffmpeg_process' in status and status['ffmpeg_process'] is not None:
+                    try:
+                        process = status['ffmpeg_process']
+                        process.stdin.write(b'q\n')
+                        process.stdin.flush()
+                        process.wait(timeout=5)
+                    except:
+                        try:
+                            process.terminate()
+                            process.wait(timeout=2)
+                        except:
+                            try:
+                                process.kill()
+                            except:
+                                pass
+                
                 # Warte kurz, damit Thread sauber beendet wird
                 time.sleep(0.5)
-                # Schließe Writer explizit
+                
+                # Schließe Writer explizit (OpenCV)
                 if 'writer' in status and status['writer'] is not None:
                     try:
                         status['writer'].release()
                         logger.info(f"Aufnahme geschlossen: {status.get('filename', 'unbekannt')}")
+                    except:
+                        pass
+                
+                # Schließe Video-Capture
+                if 'cap' in status and status['cap'] is not None:
+                    try:
+                        status['cap'].release()
                     except:
                         pass
         except Exception as e:
@@ -1802,6 +2470,24 @@ if __name__ == '__main__':
     print("\n" + "=" * 60)
     print("Web-Server läuft auf http://localhost:8080")
     print("=" * 60 + "\n")
+    
+    # URL für Dashboard
+    dashboard_url = 'http://localhost:8080'
+    
+    # Öffne Browser nach kurzer Verzögerung (damit Server gestartet ist)
+    def open_browser():
+        time.sleep(1.5)  # Warte bis Server gestartet ist
+        try:
+            # webbrowser.open() öffnet automatisch den Standard-Browser
+            # und öffnet einen neuen Tab, falls Browser bereits geöffnet ist
+            webbrowser.open(dashboard_url)
+            print(f"✓ Browser geöffnet: {dashboard_url}")
+        except Exception as e:
+            print(f"⚠️ Konnte Browser nicht automatisch öffnen: {e}")
+            print(f"   Bitte öffnen Sie manuell: {dashboard_url}")
+    
+    browser_thread = threading.Thread(target=open_browser, daemon=True)
+    browser_thread.start()
     
     try:
         # Debug=False verhindert doppeltes Laden des Codes
