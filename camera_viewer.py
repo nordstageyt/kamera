@@ -13,6 +13,7 @@ import platform
 import webbrowser
 import subprocess
 import shutil
+import json
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from onvif import ONVIFCamera, ONVIFError
@@ -46,12 +47,15 @@ scan_lock = threading.Lock()
 # Video-Aufnahme Konfiguration
 VIDEO_QUALITY = 65  # Qualität für Video-Aufnahmen (0-100, höher = bessere Qualität, größere Datei)
 
-# Globale Login-Daten für alle Kameras
+# Konfigurationsdatei
+CONFIG_FILE = 'config.json'
+
+# Globale Login-Daten für alle Kameras (werden aus config.json geladen)
 camera_username = 'admin'
 camera_password = '123456'
 credentials_lock = threading.Lock()
 
-# Aufnahme-Einstellungen
+# Aufnahme-Einstellungen (werden aus config.json geladen)
 record_half_resolution = True  # True = halbierte Auflösung für Aufnahmen (Standard: True)
 
 # FFmpeg Verfügbarkeit
@@ -947,6 +951,61 @@ HTML_TEMPLATE = """
 </body>
 </html>
 """
+
+
+def load_config():
+    """Lädt Konfiguration aus config.json"""
+    global camera_username, camera_password, record_half_resolution
+    
+    if not os.path.exists(CONFIG_FILE):
+        logger.info("Keine Konfigurationsdatei gefunden, verwende Standardwerte")
+        save_config()  # Erstelle Standard-Konfigurationsdatei
+        return
+    
+    try:
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        
+        with credentials_lock:
+            camera_username = config.get('username', 'admin')
+            camera_password = config.get('password', '123456')
+            record_half_resolution = config.get('half_resolution', True)
+        
+        logger.info(f"Konfiguration geladen: Username={camera_username}, HalfResolution={record_half_resolution}")
+    except Exception as e:
+        logger.error(f"Fehler beim Laden der Konfiguration: {e}, verwende Standardwerte")
+        save_config()  # Erstelle Standard-Konfigurationsdatei bei Fehler
+
+
+def save_config():
+    """Speichert aktuelle Konfiguration in config.json"""
+    global camera_username, camera_password, record_half_resolution
+    
+    try:
+        with credentials_lock:
+            config = {
+                'username': camera_username,
+                'password': camera_password,
+                'half_resolution': record_half_resolution
+            }
+        
+        # Erstelle Backup der alten Konfiguration falls vorhanden
+        if os.path.exists(CONFIG_FILE):
+            try:
+                backup_file = CONFIG_FILE + '.bak'
+                shutil.copy2(CONFIG_FILE, backup_file)
+            except:
+                pass
+        
+        # Speichere neue Konfiguration
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"Konfiguration gespeichert: Username={camera_username}, HalfResolution={record_half_resolution}")
+        return True
+    except Exception as e:
+        logger.error(f"Fehler beim Speichern der Konfiguration: {e}")
+        return False
 
 
 def check_ffmpeg():
@@ -2123,6 +2182,10 @@ def set_credentials():
             camera_password = new_password
             record_half_resolution = new_half_resolution
         
+        # Speichere Konfiguration persistent
+        if not save_config():
+            logger.warning("Konnte Konfiguration nicht speichern, Änderungen gelten nur für diese Session")
+        
         logger.info(f"Login-Daten aktualisiert: {new_username}")
         logger.info(f"Auflösungseinstellung: {'Halbierte Auflösung' if new_half_resolution else 'Volle Auflösung'}")
         
@@ -2432,6 +2495,9 @@ if __name__ == '__main__':
     
     # Erstelle aufnahmen-Ordner beim Start
     ensure_recordings_dir()
+    
+    # Lade Konfiguration beim Start
+    load_config()
     
     # Starte Cleanup-Worker für automatisches Löschen alter Aufnahmen (24h)
     cleanup_thread = threading.Thread(target=cleanup_worker, daemon=True)

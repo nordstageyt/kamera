@@ -1,6 +1,10 @@
 # Aufnahmen-Ordner
 aufnahmen/
 
+# Konfigurationsdatei (enthält Passwörter)
+config.json
+config.json.bak
+
 # Python
 __pycache__/
 *.py[cod]
