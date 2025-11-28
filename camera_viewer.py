@@ -431,7 +431,7 @@ def get_stream_uri(camera, username, password):
         
         # Finde das Profil mit der höchsten Auflösung (Main-Stream)
         best_profile = None
-        max_resolution = 0
+        max_resolution = 0  # Starte mit 0, suche Maximum
         
         for profile in profiles:
             try:
@@ -468,14 +468,14 @@ def get_stream_uri(camera, username, password):
                         if resolution > max_resolution:
                             max_resolution = resolution
                             best_profile = profile
-                            logger.debug(f"Neues bestes Profil gefunden: {width}x{height} (Auflösung: {resolution})")
+                            logger.debug(f"Neues bestes Profil (höchste Auflösung) gefunden: {width}x{height} (Auflösung: {resolution})")
             except Exception as e:
                 logger.debug(f"Fehler beim Prüfen des Profils: {e}")
                 continue
         
-        # Falls kein Profil mit Auflösung gefunden wurde, verwende das erste
+        # Falls kein Profil mit Auflösung gefunden wurde, verwende das erste (meist Main-Stream)
         if best_profile is None:
-            logger.info("Konnte Auflösungen nicht ermitteln, verwende erstes Profil")
+            logger.info("Konnte Auflösungen nicht ermitteln, verwende erstes Profil (meist Main-Stream)")
             best_profile = profiles[0]
         else:
             logger.info(f"Verwende Profil mit höchster Auflösung: {max_resolution} Pixel (Main-Stream)")
@@ -705,6 +705,84 @@ def ensure_recordings_dir():
     os.makedirs('aufnahmen', exist_ok=True)
 
 
+def cleanup_old_recordings(max_age_hours=24):
+    """Löscht Aufnahmen, die älter als max_age_hours sind"""
+    try:
+        aufnahmen_dir = 'aufnahmen'
+        if not os.path.exists(aufnahmen_dir):
+            return 0, 0
+        
+        current_time = datetime.now()
+        deleted_count = 0
+        deleted_size = 0
+        
+        # Durchlaufe alle Dateien rekursiv
+        for root, dirs, files in os.walk(aufnahmen_dir):
+            for file in files:
+                if file.endswith('.mp4'):
+                    file_path = os.path.join(root, file)
+                    try:
+                        # Versuche Datum/Zeit aus Dateinamen zu extrahieren (Format: IP_PORT_YYYY-MM-DD_HH-MM-SS.mp4)
+                        file_age_hours = None
+                        try:
+                            # Extrahiere Datum/Zeit aus Dateinamen
+                            parts = file.replace('.mp4', '').split('_')
+                            if len(parts) >= 4:
+                                date_str = parts[-2]  # YYYY-MM-DD
+                                time_str = parts[-1]  # HH-MM-SS
+                                file_datetime = datetime.strptime(f"{date_str}_{time_str}", "%Y-%m-%d_%H-%M-%S")
+                                file_age_hours = (current_time - file_datetime).total_seconds() / 3600
+                        except:
+                            pass
+                        
+                        # Fallback: Verwende mtime (Modifikationszeit)
+                        if file_age_hours is None:
+                            file_mtime = datetime.fromtimestamp(os.path.getmtime(file_path))
+                            file_age_hours = (current_time - file_mtime).total_seconds() / 3600
+                        
+                        # Prüfe ob Datei älter als max_age_hours ist
+                        if file_age_hours > max_age_hours:
+                            file_size = os.path.getsize(file_path)
+                            os.remove(file_path)
+                            deleted_count += 1
+                            deleted_size += file_size
+                            logger.debug(f"Gelöscht (älter als {max_age_hours}h, {file_age_hours:.1f}h alt): {file_path}")
+                    except Exception as e:
+                        logger.error(f"Fehler beim Löschen von {file_path}: {e}")
+        
+        # Lösche leere Ordner
+        for root, dirs, files in os.walk(aufnahmen_dir, topdown=False):
+            for dir_name in dirs:
+                dir_path = os.path.join(root, dir_name)
+                try:
+                    if not os.listdir(dir_path):  # Ordner ist leer
+                        os.rmdir(dir_path)
+                        logger.debug(f"Leerer Ordner gelöscht: {dir_path}")
+                except:
+                    pass
+        
+        if deleted_count > 0:
+            logger.info(f"Bereinigung: {deleted_count} Dateien gelöscht ({deleted_size/(1024*1024):.1f} MB), älter als {max_age_hours} Stunden")
+        
+        return deleted_count, deleted_size
+    except Exception as e:
+        logger.error(f"Fehler bei der Bereinigung alter Aufnahmen: {e}")
+        return 0, 0
+
+
+def cleanup_worker():
+    """Hintergrund-Thread für regelmäßige Bereinigung alter Aufnahmen"""
+    while True:
+        try:
+            # Warte 1 Stunde
+            time.sleep(3600)
+            # Führe Bereinigung durch (Dateien älter als 24 Stunden)
+            cleanup_old_recordings(max_age_hours=24)
+        except Exception as e:
+            logger.error(f"Fehler im Cleanup-Worker: {e}")
+            time.sleep(3600)  # Warte weiterhin bei Fehler
+
+
 def get_recording_filename(camera_host, camera_port):
     """Erstellt Dateinamen und Ordnerstruktur: aufnahmen/YYYY-MM-DD/HH-MM_HH-MM/IP_PORT_YYYY-MM-DD_HH-MM-SS.mp4"""
     now = datetime.now()
@@ -851,9 +929,41 @@ def record_camera(camera_index):
         
         # Erstelle neue Datei
         current_filename = get_recording_filename(host, port)
-        # MP4-Format mit mp4v Codec
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        current_writer = cv2.VideoWriter(current_filename, fourcc, fps, (width, height))
+        # MP4-Format mit H.264 Codec für bessere Komprimierung
+        # Versuche verschiedene H.264 Codecs (abhängig von System)
+        fourcc = None
+        for codec_name in ['avc1', 'H264', 'h264', 'X264']:
+            try:
+                test_fourcc = cv2.VideoWriter_fourcc(*codec_name)
+                # Teste ob Codec funktioniert
+                test_writer = cv2.VideoWriter('/tmp/test_codec.mp4', test_fourcc, fps, (width, height))
+                if test_writer.isOpened():
+                    test_writer.release()
+                    try:
+                        os.remove('/tmp/test_codec.mp4')
+                    except:
+                        pass
+                    fourcc = test_fourcc
+                    logger.debug(f"H.264 Codec '{codec_name}' funktioniert")
+                    break
+            except:
+                continue
+        
+        # Fallback auf mp4v falls H.264 nicht verfügbar
+        if fourcc is None:
+            logger.warning("H.264 Codec nicht verfügbar, verwende mp4v")
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        
+        # Erstelle VideoWriter mit Qualitätsparameter
+        # Versuche Qualitätsparameter zu setzen (nicht alle Codecs unterstützen das)
+        try:
+            current_writer = cv2.VideoWriter(current_filename, fourcc, fps, (width, height))
+            # Setze Qualität (0-100, höher = bessere Qualität, größere Datei)
+            # 85 ist ein guter Kompromiss zwischen Qualität und Dateigröße
+            current_writer.set(cv2.VIDEOWRITER_PROP_QUALITY, 85)
+        except:
+            # Fallback ohne Qualitätsparameter
+            current_writer = cv2.VideoWriter(current_filename, fourcc, fps, (width, height))
         
         if not current_writer.isOpened():
             logger.error(f"Konnte VideoWriter nicht erstellen: {current_filename}")
@@ -1112,6 +1222,16 @@ if __name__ == '__main__':
     
     # Erstelle aufnahmen-Ordner beim Start
     ensure_recordings_dir()
+    
+    # Starte Cleanup-Worker für automatisches Löschen alter Aufnahmen (24h)
+    cleanup_thread = threading.Thread(target=cleanup_worker, daemon=True)
+    cleanup_thread.start()
+    logger.info("Cleanup-Worker gestartet: Löscht automatisch Aufnahmen älter als 24 Stunden")
+    
+    # Führe einmalige Bereinigung beim Start durch
+    deleted_count, deleted_size = cleanup_old_recordings(max_age_hours=24)
+    if deleted_count > 0:
+        print(f"\n✓ Bereinigung beim Start: {deleted_count} alte Dateien gelöscht ({deleted_size/(1024*1024):.1f} MB)")
     
     print("=" * 60)
     print("ONVIF Camera Viewer")
